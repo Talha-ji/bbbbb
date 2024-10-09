@@ -1,0 +1,213 @@
+name: Lambda CI/CD Pipeline
+
+on:
+  push:
+    branches: [develop, qa, main]
+  pull_request:
+    branches: [develop, qa, main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        environment: [dev, qa, prod]
+        include:
+          - environment: dev
+            branch: develop
+          - environment: qa
+            branch: qa
+          - environment: prod
+            branch: main
+
+    environment: ${{ matrix.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        if: github.ref_name == matrix.branch
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "20"
+        if: github.ref_name == matrix.branch
+
+      - name: Package Lambda Functions
+        if: github.ref_name == matrix.branch
+        run: |
+          SKIP_FOLDERS=("highpeak-fns-lambda-starter")
+
+          for FUNCTION_DIR in functions/*; do
+            if [ -d "$FUNCTION_DIR" ]; then
+              FUNCTION_NAME=$(basename $FUNCTION_DIR)
+
+              if [[ " ${SKIP_FOLDERS[@]} " =~ " ${FUNCTION_NAME} " ]]; then
+                echo "Skipping packaging for $FUNCTION_NAME"
+                continue
+              fi
+
+              echo "Packaging $FUNCTION_NAME"
+              cd $FUNCTION_DIR
+              if [ -f package.json ]; then
+                if [ -f package-lock.json ]; then
+                  npm ci
+                else
+                  npm install
+                fi
+              else
+                echo "No package.json found in $FUNCTION_DIR. Skipping npm install."
+              fi
+              zip -r ../../${FUNCTION_NAME}.zip ./src -i '*.mjs'
+              cd ../..
+            fi
+          done
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.MGMT_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+        if: github.ref_name == matrix.branch
+
+      - name: Deploy Lambda Functions
+        if: github.ref_name == matrix.branch
+        env:
+          ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
+          LAMBDA_EXECUTION_ROLE_ARN: ${{ secrets.ROLE_NAME }}
+          CURRENT_ENV: ${{ matrix.environment }}
+        run: |
+          set -e
+          echo "Starting Lambda deployment process..."
+          echo "AWS CLI version:"
+          aws --version
+          echo "Current AWS identity:"
+          aws sts get-caller-identity
+
+          echo "Using Lambda execution role: $LAMBDA_EXECUTION_ROLE_ARN"
+          
+          echo "Assuming role: $LAMBDA_EXECUTION_ROLE_ARN"
+          CREDENTIALS=$(aws sts assume-role --role-arn $LAMBDA_EXECUTION_ROLE_ARN --role-session-name LambdaDeploymentSession)
+          export AWS_ACCESS_KEY_ID=$(echo $CREDENTIALS | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(echo $CREDENTIALS | jq -r '.Credentials.SecretAccessKey')
+          export AWS_SESSION_TOKEN=$(echo $CREDENTIALS | jq -r '.Credentials.SessionToken')
+
+          echo "Assumed role identity:"
+          aws sts get-caller-identity
+
+          for FUNCTION_ZIP in *.zip; do
+            FUNCTION_NAME="${FUNCTION_ZIP%.zip}"
+            FULL_FUNCTION_NAME="${FUNCTION_NAME}-${{ matrix.environment }}"
+            echo "Processing function: $FULL_FUNCTION_NAME"
+
+            # Load environment variables dynamically from the .env file if it exists
+            if [ -f "functions/$FUNCTION_NAME/.env" ]; then
+              echo "Loading environment variables from .env for $FUNCTION_NAME"
+              # Load and export all variables from the .env file
+              set -o allexport
+              source "functions/$FUNCTION_NAME/.env"
+              set +o allexport
+
+              # Prepare the variables in the required format for AWS CLI
+              ENV_VARS=$(cat "functions/$FUNCTION_NAME/.env" | sed 's/^/Variables={/' | sed 's/$/}/' | tr '\n' ',')
+              ENV_VARS=${ENV_VARS%,}  # Remove the trailing comma
+            else
+              echo "No .env file found for $FUNCTION_NAME, skipping environment variable loading."
+            fi
+            
+            # Check if the function exists
+            if aws lambda get-function --function-name $FULL_FUNCTION_NAME &> /dev/null; then
+              echo "Function $FULL_FUNCTION_NAME exists. Attempting to update..."
+              UPDATE_OUTPUT=$(aws lambda update-function-code \
+                --function-name $FULL_FUNCTION_NAME \
+                --zip-file fileb://$FUNCTION_ZIP 2>&1)
+              
+              UPDATE_EXIT_CODE=$?
+              echo "Update command exit code: $UPDATE_EXIT_CODE"
+              echo "Full update function output:"
+              echo "$UPDATE_OUTPUT"
+              
+              if [ $UPDATE_EXIT_CODE -eq 0 ]; then
+                echo "Successfully updated function $FULL_FUNCTION_NAME"
+                aws lambda update-function-configuration \
+                  --function-name $FULL_FUNCTION_NAME \
+                  --environment "$ENV_VARS"
+              else
+                echo "Failed to update function $FULL_FUNCTION_NAME"
+                echo "Error code: $UPDATE_EXIT_CODE"
+                echo "Error output:"
+                echo "$UPDATE_OUTPUT"
+                echo "Debugging information:"
+                aws sts get-caller-identity
+                aws lambda get-function --function-name $FULL_FUNCTION_NAME
+                exit 1
+              fi
+            else
+              echo "Function $FULL_FUNCTION_NAME does not exist. Attempting to create..."
+              CREATE_OUTPUT=$(aws lambda create-function \
+                --function-name $FULL_FUNCTION_NAME \
+                --runtime nodejs20.x \
+                --role $LAMBDA_EXECUTION_ROLE_ARN \
+                --handler src/index.handler \
+                --zip-file fileb://$FUNCTION_ZIP 2>&1)
+              
+              CREATE_EXIT_CODE=$?
+              echo "Create command exit code: $CREATE_EXIT_CODE"
+              echo "Full create function output:"
+              echo "$CREATE_OUTPUT"
+              
+              if [ $CREATE_EXIT_CODE -eq 0 ]; then
+                echo "Successfully created function $FULL_FUNCTION_NAME"
+                aws lambda update-function-configuration \
+                  --function-name $FULL_FUNCTION_NAME \
+                  --environment "$ENV_VARS"
+              else
+                echo "Failed to create function $FULL_FUNCTION_NAME"
+                echo "Error code: $CREATE_EXIT_CODE"
+                echo "Error output:"
+                echo "$CREATE_OUTPUT"
+                echo "Debugging information:"
+                aws sts get-caller-identity
+                aws iam get-role --role-name $ROLE_NAME
+                exit 1
+              fi
+            fi
+            
+            echo "Completed processing for $FULL_FUNCTION_NAME"
+            echo "----------------------------------------"
+          done
+
+          echo "Lambda deployment process completed."
+
+  create-pr:
+    needs: build-and-deploy
+    runs-on: ubuntu-latest
+    if: github.ref_name != 'main' 
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: Sync ${{ github.ref_name }} to main
+          title: Sync ${{ github.ref_name }} to main
+          body: |
+            This PR is automatically created to sync the ${{ github.ref_name }} branch to main.
+            Please review and merge if all checks pass.
+          branch: sync-${{ github.ref_name }}-to-main
+          base: main
+          delete-branch: true
+
+      - name: Check outputs
+        if: ${{ steps.create-pull-request.outputs.pull-request-number }}
+        run: |
+          echo "Pull Request Number - ${{ steps.create-pull-request.outputs.pull-request-number }}"
+          echo "Pull Request URL - ${{ steps.create-pull-request.outputs.pull-request-url }}"
